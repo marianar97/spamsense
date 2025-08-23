@@ -5,6 +5,9 @@ import os
 import sys
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
+import json
+from datetime import datetime
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -136,12 +139,13 @@ class TelephonyAgent(Agent):
 async def entrypoint(ctx: JobContext):
     async def write_transcript():
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-
         # This example writes to the temporary directory, but you can save to any location
-        filename = f"/tmp/transcript_{ctx.room.name}_{current_date}.json"
+        filename = f"transcripts/transcript_{ctx.room.name}_{current_date}.json"
+
+        session_dict = ctx.session.to_dict()
         
         with open(filename, 'w') as f:
-            json.dump(session.history.to_dict(), f, indent=2)
+            json.dump(session_dict, f, indent=2)
             
         print(f"Transcript for {ctx.room.name} saved to {filename}")
 
@@ -151,14 +155,12 @@ async def entrypoint(ctx: JobContext):
 
     timezone = "utc"
 
-    session = AgentSession[Userdata](
-        userdata=Userdata(),
-        stt=deepgram.STT(),
-        llm=openai.LLM(model="gpt-4o", parallel_tool_calls=False, temperature=0.45),
-        tts=cartesia.TTS(voice="39b376fc-488e-4d0c-8b37-e00b72059fdd", speed="fast"),
-        turn_detection=MultilingualModel(),
+    session = AgentSession(
+        stt=deepgram.STT(model="nova-3", language="multi"),
+        llm=openai.LLM(model="gpt-4o-mini"),
+        tts=cartesia.TTS(model="sonic-2", voice="f786b574-daa5-4673-aa0c-cbe3e8534c02"),
         vad=silero.VAD.load(),
-        max_tool_steps=1,
+        turn_detection=MultilingualModel(),
     )
 
     await session.start(agent=TelephonyAgent(timezone=timezone), room=ctx.room)
