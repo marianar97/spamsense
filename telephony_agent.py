@@ -20,6 +20,7 @@ from livekit.agents import (
     RunContext,
     WorkerOptions,
     cli,
+    get_job_context,
     function_tool,
 )
 from livekit.plugins import cartesia, deepgram, openai, silero
@@ -29,18 +30,27 @@ load_dotenv()
 
 logger = logging.getLogger("telephony_agent")
 
-# Add this function definition anywhere
-async def hangup_call():
-    ctx = get_job_context()
-    if ctx is None:
-        # Not running in a job context
-        return
+
+def convert_transcript_to_messages(transcript: dict) -> list[dict[str, str]]:
+    """
+    Convert a transcript of the shape {"items": [{"role": str, "content": list[str]|str, ...}, ...]}
+    into a simplified list of message dicts: {"role": "agent"|"user", "content": str}.
+
+    - Map role "assistant" -> "agent"; keep "user" as-is; skip other roles.
+    - Flatten content arrays into a single string; ignore non-string entries.
+    - Skip items that have empty or missing textual content.
+    """
+    items = transcript.get("items", [])
+    messages: list[dict[str, str]] = []
+    for item in items:
+        role = item.get("role")
+        role = "agent" if role == "assistant" else "user"
+        content = "".join(item.get("content")).strip()
+        confidence = item.get("transcript_confidence", .80)
+        messages.append({"role": role, "response": content, "confidence": confidence, "timestamp": "2024-01-20T10:30:15.000Z",})
+
     
-    await ctx.api.room.delete_room(
-        api.DeleteRoomRequest(
-            room=ctx.room.name,
-        )
-    )
+    return messages
 
 class TelephonyAgent(Agent):
     def __init__(self, *, timezone: str) -> None:
@@ -97,7 +107,6 @@ class TelephonyAgent(Agent):
                 - Summarize briefly: "So I have [caller's name] from [company/context] calling about [brief topic], and you can be reached at [number]."
                 - Set expectations: "I'll make sure Mariana gets this message" or "Mariana will get back to you by [timeframe]"
                 - Thank the caller professionally
-                - Call the end_call function to hang up the call
 
                 ### Voice and Tone Guidelines
                 - Speak clearly and at a moderate pace
@@ -125,32 +134,27 @@ class TelephonyAgent(Agent):
         )
 
 
-    # to hang up the call as part of a function call
-    @function_tool
-    async def end_call(self, ctx: RunContext):
-        """Called when the user wants to end the call"""
-        # let the agent finish speaking
-        current_speech = ctx.session.current_speech
-        if current_speech:
-            await current_speech.wait_for_playout()
-
-        await hangup_call()
 
 async def entrypoint(ctx: JobContext):
     async def write_transcript():
         current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # This example writes to the temporary directory, but you can save to any location
-        filename = f"transcripts/transcript_{ctx.room.name}_{current_date}.json"
 
-        session_dict = ctx.session.to_dict()
+        # This example writes to the temporary directory, but you can save to any location
+        filename = f"/tmp/transcript_{ctx.room.name}_{current_date}.json"
+        transcript = session.history.to_dict()
+        messages = convert_transcript_to_messages(transcript)
+        messages1 =  f"/tmp/messages_{ctx.room.name}_{current_date}.json"
         
         with open(filename, 'w') as f:
-            json.dump(session_dict, f, indent=2)
+            json.dump(transcript, f, indent=2)
+        
+        with open(messages1, 'w') as f:
+            json.dump(messages, f, indent=2)
             
         print(f"Transcript for {ctx.room.name} saved to {filename}")
+        print(f"Messages for {ctx.room.name} saved to {messages1}")
 
     ctx.add_shutdown_callback(write_transcript)
-
     await ctx.connect()
 
     timezone = "utc"
