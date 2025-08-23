@@ -24,14 +24,7 @@ from livekit import api, rtc
 
 load_dotenv()
 
-
-@dataclass
-class Userdata:
-    cal: Calendar
-
-
 logger = logging.getLogger("telephony_agent")
-
 
 # Add this function definition anywhere
 async def hangup_call():
@@ -141,6 +134,19 @@ class TelephonyAgent(Agent):
         await hangup_call()
 
 async def entrypoint(ctx: JobContext):
+    async def write_transcript():
+        current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # This example writes to the temporary directory, but you can save to any location
+        filename = f"/tmp/transcript_{ctx.room.name}_{current_date}.json"
+        
+        with open(filename, 'w') as f:
+            json.dump(session.history.to_dict(), f, indent=2)
+            
+        print(f"Transcript for {ctx.room.name} saved to {filename}")
+
+    ctx.add_shutdown_callback(write_transcript)
+
     await ctx.connect()
 
     timezone = "utc"
