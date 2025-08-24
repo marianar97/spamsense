@@ -41,6 +41,8 @@ class IntentResult(BaseModel):
     primary: Optional[Literal["personal", "business", "spam"]] = Field(None, description="Main category of the call")
     confidence: Optional[float] = Field(None, description="Float 0.0-1.0 representing certainty in your analysis")
 
+class CallType(BaseModel):
+    type: Literal["personal", "business"] = Field(None, description="string of whether the call is personal or business")
 
 load_dotenv()
 
@@ -210,6 +212,56 @@ def post_summary(call_id: str, intent_result: IntentResult, transcript_id: Optio
     except urllib.error.URLError as e:
         logger.error("Failed to publish summary (URL error): %s", getattr(e, "reason", e))
         raise 
+
+
+def post_call_type(call_id: str, call_type: CallType):
+    """
+    Update the call type (personal/business) via PUT request to the SpamSense API.
+    
+    Args:
+        call_id: The call ID to update
+        call_type: The CallType object containing the type classification
+    """
+    base_url = os.getenv("SPAMSENSE_API_BASE_URL", "https://spamsense.vercel.app")
+    update_call_url = f"{base_url}/api/calls"
+    
+    # Extract type from the parsed CallType object, default to "personal" if not available
+    call_type_value = getattr(call_type, 'type', 'personal') if call_type else 'personal'
+    
+    payload = {
+        "callId": call_id,
+        "type": call_type_value,
+        "notes": f"Automatically classified as {call_type_value} call by AI"
+    }
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        update_call_url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="PUT",
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            try:
+                result = json.loads(raw.decode("utf-8"))
+            except Exception:
+                result = {"status": getattr(resp, "status", None), "body": raw.decode("utf-8")}
+            
+            logger.info("Updated call type to '%s' for callId=%s", call_type_value, call_id)
+            return result
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8") if e.fp else ""
+        logger.error("Failed to update call type (HTTP %s): %s", getattr(e, "code", "?"), body)
+        raise
+    except urllib.error.URLError as e:
+        logger.error("Failed to update call type (URL error): %s", getattr(e, "reason", e))
+        raise
 
 
 def create_call_id(caller_number: str, duration: int):
@@ -395,7 +447,13 @@ async def entrypoint(ctx: JobContext):
             logger.info(f"Transcript for {ctx.room.name} saved to {messages_file}")
             
             # Run classify_intent asynchronously
+            print("!@# calling classify_intent")
             await classify_intent(call_id)
+
+            print("!@# calling classify_call")
+            await classify_call(call_id)
+
+            print("!@# finished")
 
         except Exception as e:
             logger.error(f"Error in write_transcript: {e}")
@@ -455,6 +513,46 @@ async def entrypoint(ctx: JobContext):
             logger.error(f"Error in classify_intent: {e}")
             # Don't raise the exception to avoid blocking other shutdown callbacks
 
+
+    async def classify_call(call_id):
+        try:
+            # Get the call_id from the write_transcript process
+            print("caller_number", ctx.room.name)
+            caller_number = (ctx.room.name or "").split("_", 1)[0]
+            caller_number = "+13512443432" if not caller_number else caller_number
+            # Initialize OpenAI client
+            client = OpenAI()
+
+            system_instructions = (
+            "You are a call transcript analyzer. Analyze the transcript and return business if the call a business call  or personal if it's a personal call. Answer with that single word")
+            
+            transcript = session.history.to_dict()
+            user_prompt = f"Analyze this phone call transcript and extract the structured information:\n\n{transcript}"
+
+            response = client.responses.parse(
+            model="gpt-4o-2024-08-06",
+            input=[
+                {"role": "system", "content": system_instructions},
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            text_format=CallType,
+            )
+
+            parsed = response.output_parsed
+
+            # Post the summary to the API
+            print("!@# calling post summary")
+            print("!@# parsed", parsed)
+            post_call_type(call_id, parsed)
+            
+            logger.info(f"post called type completed {call_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in classify_intent: {e}")
+            # Don't raise the exception to avoid blocking other shutdown callbacks
 
     ctx.add_shutdown_callback(write_transcript)
     await ctx.connect()
