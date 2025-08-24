@@ -9,9 +9,12 @@ from zoneinfo import ZoneInfo
 import json
 from datetime import datetime
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
-from typing import Any
+from typing import Any, Literal, Optional
 import urllib.request
 import urllib.error
+from pydantic import BaseModel, Field
+from openai import OpenAI
+
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -29,6 +32,15 @@ from livekit.agents import (
 )
 from livekit.plugins import cartesia, deepgram, openai, silero
 from livekit import api, rtc
+
+class IntentResult(BaseModel):
+    sentiment: Optional[str] = Field(None, description="sentiment of the call")
+    summary: Optional[str] = Field(None, description="two-sentences summary of caller's need in natural language"
+    )
+    urgency: Optional[Literal["low", "medium", "high"]] = Field(None, description="Urgency level of the caller's need")
+    primary: Optional[Literal["personal", "business", "spam"]] = Field(None, description="Main category of the call")
+    confidence: Optional[float] = Field(None, description="Float 0.0-1.0 representing certainty in your analysis")
+
 
 load_dotenv()
 
@@ -68,13 +80,14 @@ def convert_transcript_to_messages(transcript: dict) -> list[dict[str, str]]:
 
     return messages
 
-def post_to_convex(call_id: str, transcript):
+def post_to_convex(call_id: str, transcript, duration: int):
     """
     Send transcript data to the SpamSense API publish transcript endpoint.
     
     Args:
         call_id: The call ID from the previously created call
         transcript: List of message dictionaries with role, response, confidence, timestamp
+        duration: Total call duration in seconds
     """
     base_url = os.getenv("SPAMSENSE_API_BASE_URL", "https://spamsense.vercel.app")
     transcript_url = f"{base_url}/api/transcripts"
@@ -86,10 +99,7 @@ def post_to_convex(call_id: str, transcript):
         response = msg.get("response", "")
         full_transcript_parts.append(f"{role}: {response}")
     
-    full_transcript = "\\n".join(full_transcript_parts)
-    
-    # Calculate duration (mock data - could be calculated from timestamps)
-    duration = 420  # 7 minutes default
+    full_transcript = "\n".join(full_transcript_parts)
     
     payload = {
         "callId": call_id,
@@ -132,8 +142,77 @@ def post_to_convex(call_id: str, transcript):
         logger.error("Failed to publish transcript (URL error): %s", getattr(e, "reason", e))
         raise 
 
+def post_summary(call_id: str, intent_result: IntentResult, transcript_id: Optional[str] = None):
+    """
+    Send summary data to the SpamSense API publish summary endpoint.
+    
+    Args:
+        call_id: The call ID from the previously created call
+        intent_result: The IntentResult object containing parsed intent data
+        transcript_id: Optional transcript ID if available
+    """
+    base_url = os.getenv("SPAMSENSE_API_BASE_URL", "https://spamsense.vercel.app")
+    summary_url = f"{base_url}/api/summaries"
+    
+    # Map IntentResult fields to API expected format
+    intent_data = {
+        "primary": intent_result.primary or "personal",
+        "confidence": int((intent_result.confidence or 0.5) * 100),  # Convert to percentage
+        "keywords": [],  # Mock keywords since not in IntentResult
+        "sentiment": intent_result.sentiment or "neutral",
+        "urgency": intent_result.urgency or "low"
+    }
+    
+    # Mock additional data if not available
+    payload = {
+        "callId": call_id,
+        "summary": intent_result.summary or "Call summary not available",
+        "intent": intent_data,
+        "keyPoints": [intent_result.summary] if intent_result.summary else ["No key points extracted"],
+        "actionItems": [],
+        "followUpRequired": intent_result.urgency == "high",
+        "satisfactionScore": 7,  # Default satisfaction score
+        "createdAt": datetime.now().isoformat(),
+        "aiModel": os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    }
+    
+    if transcript_id:
+        payload["transcriptId"] = transcript_id
+    
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        summary_url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            try:
+                result = json.loads(raw.decode("utf-8"))
+            except Exception:
+                result = {"status": getattr(resp, "status", None), "body": raw.decode("utf-8")}
+            
+            if isinstance(result, dict) and "summaryId" in result:
+                logger.info("Published summary with summaryId=%s", result["summaryId"])
+            else:
+                logger.warning("Publish summary response: %s", result)
+            return result
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8") if e.fp else ""
+        logger.error("Failed to publish summary (HTTP %s): %s", getattr(e, "code", "?"), body)
+        raise
+    except urllib.error.URLError as e:
+        logger.error("Failed to publish summary (URL error): %s", getattr(e, "reason", e))
+        raise 
 
-def create_call_id():
+
+def create_call_id(caller_number: str, duration: int):
     """
     Step 1: Create a call record in SpamSense API and return its response.
 
@@ -151,12 +230,11 @@ def create_call_id():
     create_call_url = f"{base_url}/api/calls"
 
     ts_str = datetime.now().isoformat()
-    phone_number = os.getenv("DEFAULT_CALLER_PHONE", "+1-555-TEST-001")
     payload: dict[str, Any] = {
-        "phoneNumber": phone_number,
+        "phoneNumber": caller_number,
         "type": "personal",
         "status": "allowed",
-        "duration": 420,
+        "duration": duration,
         "timestamp": ts_str,
         "isSpam": False,
         "confidence": 5,
@@ -286,10 +364,16 @@ class TelephonyAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext):
+    session_start_time = datetime.now()
     async def write_transcript():
         try:
+            # Compute actual call duration
+            duration_seconds = max(1, int((datetime.now() - session_start_time).total_seconds() - 30))
             # Create call record and get call ID
-            call_id = create_call_id()
+            caller_number = (ctx.room.name or "").split("_", 1)[0]
+            caller_number = "+13512443432" if not caller_number else caller_number
+
+            call_id = create_call_id(caller_number, duration_seconds)
             if not call_id:
                 logger.error("Failed to create call - cannot publish transcript")
                 return
@@ -306,13 +390,71 @@ async def entrypoint(ctx: JobContext):
                 json.dump(messages, f, indent=2)
             
             # Publish transcript to API
-            post_to_convex(call_id, messages)
+            post_to_convex(call_id, messages, duration_seconds)
             
             logger.info(f"Transcript for {ctx.room.name} saved to {messages_file}")
             
+            # Run classify_intent asynchronously
+            await classify_intent(call_id)
+
         except Exception as e:
             logger.error(f"Error in write_transcript: {e}")
             raise
+
+    async def classify_intent(call_id):
+        try:
+            # Get the call_id from the write_transcript process
+            caller_number = (ctx.room.name or "").split("_", 1)[0]
+            caller_number = "+13512443432" if not caller_number else caller_number
+            # Initialize OpenAI client
+            client = OpenAI()
+
+            system_instructions = (
+            "You are a call transcript analyzer. Extract key information from phone call transcripts and return structured data.\n\n"
+            
+            "Required output fields:\n"
+            "- sentiment: positive or neutral or negative"
+            "- summary: two clear sentences describing what the caller wants or why they called\n"
+            "- urgency: 'low' (routine/informational), 'medium' (time-sensitive), or 'high' (emergency/critical)\n"
+            "- primary: 'personal' (friends/family), 'business' (business opportunity), 'spam' (unsolicited sales/marketing)\n"
+            "- confidence: Float 0.0-1.0 representing certainty in your analysis\n\n"
+            
+            "Analysis approach:\n"
+            "- Use only information explicitly stated or clearly implied in the transcript\n"
+            "- When in doubt, choose lower urgency and confidence scores\n"
+            "- For mixed-topic calls, focus on the primary/main purpose\n"
+            "- Consider emotional indicators (frustrated, rushed, casual tone) for urgency\n"
+            "- Mark as spam if caller is clearly selling something unsolicited or uses robotic language\n\n"
+            
+            "Return null for any field where information is genuinely unclear or missing.")
+            
+            transcript = session.history.to_dict()
+            user_prompt = f"Analyze this phone call transcript and extract the structured information:\n\n{transcript}"
+
+            response = client.responses.parse(
+            model="gpt-4o-2024-08-06",
+            input=[
+                {"role": "system", "content": system_instructions},
+                {
+                    "role": "user",
+                    "content": user_prompt,
+                },
+            ],
+            text_format=IntentResult,
+            )
+
+            parsed = response.output_parsed
+
+            # Post the summary to the API
+            print("!@# calling post summary")
+            post_summary(call_id, parsed)
+            
+            logger.info(f"Intent classification completed for call {call_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in classify_intent: {e}")
+            # Don't raise the exception to avoid blocking other shutdown callbacks
+
 
     ctx.add_shutdown_callback(write_transcript)
     await ctx.connect()
@@ -326,6 +468,9 @@ async def entrypoint(ctx: JobContext):
         vad=silero.VAD.load(),
         turn_detection=MultilingualModel(),
     )
+
+    # Reset start time to when the session begins
+    session_start_time = datetime.now()
 
     await session.start(agent=TelephonyAgent(timezone=timezone), room=ctx.room)
 
